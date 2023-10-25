@@ -11,6 +11,7 @@ from asdff.utils import (
     ADOutput,
     bbox_padding,
     composite,
+    dilate_erode,
     mask_dilate,
     mask_gaussian_blur,
 )
@@ -47,8 +48,12 @@ class AdPipelineBase(ABC):
         detectors: DetectorType | Iterable[DetectorType] | None = None,
         mask_dilation: int = 4,
         mask_blur: int = 4,
+        mask_blur_type: str = "gaussian",
         mask_padding: int = 32,
         asdff_enabled: bool = True,
+        mask_image_enhance: dict[str, Any] | None = None,
+        fp16: bool = True,
+        fuse: bool = True
     ):
         if common is None:
             common = {}
@@ -64,69 +69,72 @@ class AdPipelineBase(ABC):
         elif not isinstance(detectors, Iterable):
             detectors = [detectors]
 
-        if images and txt2img_only:
-            logger.warning(
-                "Both `images` and `txt2img_only` are specified. if `images` is specified, `txt2img_only` is ignored."
-            )
-
         if images is None:
-            txt2img_args = self._get_txt2img_args(common, txt2img_only)
-            txt2img_output = self.txt2img_class.__call__(self, **txt2img_args)
-            txt2img_images: list[Image.Image] = txt2img_output[0]
+            txt2img_output = self.process_txt2img(common, txt2img_only)
+            txt2img_images = txt2img_output[0]
         else:
-            if not isinstance(images, Iterable):
-                txt2img_images = [images]
-            else:
-                txt2img_images = images
+            if txt2img_only:
+                msg = "Both `images` and `txt2img_only` are specified. if `images` is specified, `txt2img_only` is ignored."
+                logger.warning(msg)
+
+            txt2img_images = [images] if not isinstance(images, Iterable) else images
 
         init_images = []
         final_images = []
 
-        if asdff_enabled:
-            for i, init_image in enumerate(txt2img_images):
-                init_images.append(init_image.copy())
-                final_image = None
-
-                for j, detector in enumerate(detectors):
-                    masks = detector(init_image)
-                    if masks is None:
-                        logger.info(
-                            f"No object detected on {ordinal(i + 1)} image with {ordinal(j + 1)} detector."
-                        )
-                        continue
-
-                    for k, mask in enumerate(masks):
-                        mask = mask.convert("L")
-                        mask = mask_dilate(mask, mask_dilation)
-                        bbox = mask.getbbox()
-                        if bbox is None:
-                            logger.info(f"No object in {ordinal(k + 1)} mask.")
-                            continue
-                        mask = mask_gaussian_blur(mask, mask_blur)
-                        bbox_padded = bbox_padding(bbox, init_image.size, mask_padding)
-
-                        crop_image = init_image.crop(bbox_padded)
-                        crop_mask = mask.crop(bbox_padded)
-
-                        inpaint_args = self._get_inpaint_args(common, inpaint_only)
-                        inpaint_args["image"] = crop_image
-                        inpaint_args["mask_image"] = crop_mask
-                        inpaint_output = self.inpaint_pipeline(**inpaint_args)
-                        inpaint_image: Image.Image = inpaint_output[0][0]
-                        final_image = composite(
-                            init=init_image,
-                            mask=mask,
-                            gen=inpaint_image,
-                            bbox_padded=bbox_padded,
-                        )
-                        init_image = final_image
-
-                if final_image is not None:
-                    final_images.append(final_image)
-        else:
+        # Allows us to enable and disable after detailer for in memory applications
+        if asdff_enabled is False:
             init_images = txt2img_images
             final_images = txt2img_images
+            return ADOutput(images=final_images, init_images=init_images)
 
+        for i, init_image in enumerate(txt2img_images):
+            init_images.append(init_image.copy())
+            final_image = None
+
+            for j, detector in enumerate(detectors):
+                masks = detector(init_image, fp16=fp16, device=self.device)
+                if masks is None:
+                    logger.info(
+                        f"No object detected on {ordinal(i + 1)} image with {ordinal(j + 1)} detector."
+                    )
+                    continue
+
+                for k, mask in enumerate(masks):
+                    mask = mask.convert("L")
+                    mask = mask_dilate(mask, mask_dilation)
+                    bbox = mask.getbbox()
+                    if bbox is None:
+                        logger.info(f"No object in {ordinal(k + 1)} mask.")
+                        continue
+
+                    if mask_blur_type == "gaussian":
+                        mask = mask_gaussian_blur(mask, mask_blur)
+                    elif mask_blur_type == "box":
+                        mask = mask_gaussian_blur(mask, mask_blur)
+
+                    bbox_padded = bbox_padding(bbox, init_image.size, mask_padding)
+
+                    inpaint_output = self.process_inpainting(
+                        common,
+                        inpaint_only,
+                        init_image,
+                        mask,
+                        bbox_padded,
+                    )
+                    inpaint_image = inpaint_output[0][0]
+
+                    final_image = composite(
+                        init_image,
+                        mask,
+                        inpaint_image,
+                        bbox_padded,
+                        mask_image_enhance,
+                    )
+                    init_image = final_image
+
+            if final_image is not None:
+                final_images.append(final_image)
 
         return ADOutput(images=final_images, init_images=init_images)
 
@@ -145,9 +153,9 @@ class AdPipelineBase(ABC):
         common = dict(common)
         sig = inspect.signature(self.inpaint_pipeline)
         if (
-            "control_image" in sig.parameters
-            and "control_image" not in common
-            and "image" in common
+                "control_image" in sig.parameters
+                and "control_image" not in common
+                and "image" in common
         ):
             common["control_image"] = common.pop("image")
         return {
@@ -156,3 +164,29 @@ class AdPipelineBase(ABC):
             "num_images_per_prompt": 1,
             "output_type": "pil",
         }
+
+    def process_txt2img(
+        self, common: Mapping[str, Any], txt2img_only: Mapping[str, Any]
+    ):
+        txt2img_args = self._get_txt2img_args(common, txt2img_only)
+        return self.txt2img_class.__call__(self, **txt2img_args)
+
+    def process_inpainting(
+        self,
+        common: Mapping[str, Any],
+        inpaint_only: Mapping[str, Any],
+        init_image: Image.Image,
+        mask: Image.Image,
+        bbox_padded: tuple[int, int, int, int],
+    ):
+        crop_image = init_image.crop(bbox_padded)
+        crop_mask = mask.crop(bbox_padded)
+        inpaint_args = self._get_inpaint_args(common, inpaint_only)
+        inpaint_args["image"] = crop_image
+        inpaint_args["mask_image"] = crop_mask
+
+        if "control_image" in inpaint_args:
+            inpaint_args["control_image"] = inpaint_args["control_image"].resize(
+                crop_image.size
+            )
+        return self.inpaint_pipeline(**inpaint_args)
